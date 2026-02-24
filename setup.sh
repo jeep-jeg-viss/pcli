@@ -18,10 +18,17 @@ exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+# Check if apt package is installed
+apt_installed() {
+    dpkg -s "$1" &>/dev/null
+}
+
 # Ensure whiptail (for menu) and fzf (for repo selection) are installed
 if ! exists whiptail || ! exists fzf; then
     echo "Installing interface tools (whiptail, fzf)..."
     sudo apt-get update && sudo apt-get install -y whiptail fzf
+else
+    echo "Interface tools (whiptail, fzf) already installed."
 fi
 
 # ==========================================
@@ -50,11 +57,17 @@ has_choice() { [[ "$CHOICES" == *"$1"* ]]; }
 if has_choice "UPDATE"; then
     echo "--- Updating System ---"
     sudo apt-get update -y && sudo apt-get upgrade -y
-    sudo apt-get install -y curl wget gpg coreutils build-essential git
+    NEEDED=()
+    for pkg in curl wget gpg coreutils build-essential git; do
+        apt_installed "$pkg" || NEEDED+=("$pkg")
+    done
+    [ ${#NEEDED[@]} -gt 0 ] && sudo apt-get install -y "${NEEDED[@]}" || echo "Core packages already installed."
 fi
 
 if has_choice "DOCKER"; then
-    if ! exists docker; then
+    if exists docker; then
+        echo "Docker already installed."
+    else
         echo "--- Installing Docker ---"
         sudo install -m 0755 -d /etc/apt/keyrings
         sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
@@ -69,7 +82,9 @@ if has_choice "DOCKER"; then
 fi
 
 if has_choice "UV"; then
-    if ! exists uv; then
+    if exists uv; then
+        echo "uv already installed."
+    else
         echo "--- Installing uv ---"
         curl -LsSf https://astral.sh/uv/install.sh | sh
         export PATH="$HOME/.local/bin:$PATH"
@@ -77,8 +92,12 @@ if has_choice "UV"; then
 fi
 
 if has_choice "TOOLS"; then
-    echo "--- Installing XVFB & Vim ---"
-    sudo apt-get install -y xvfb vim
+    if apt_installed xvfb && apt_installed vim; then
+        echo "XVFB and Vim already installed."
+    else
+        echo "--- Installing XVFB & Vim ---"
+        sudo apt-get install -y xvfb vim
+    fi
 fi
 
 if has_choice "ALIAS"; then
@@ -95,7 +114,9 @@ fi
 # ==========================================
 
 if has_choice "GITHUB"; then
-    if ! exists gh; then
+    if exists gh; then
+        echo "GitHub CLI already installed."
+    else
         echo "--- Installing GitHub CLI ---"
         # Standard GH install steps...
         sudo mkdir -p -m 755 /etc/apt/keyrings && wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null
@@ -108,12 +129,15 @@ if has_choice "GITHUB"; then
     echo "--- Authenticating GitHub ---"
     if [ -n "$GITHUB_TOKEN" ]; then
         echo "$GITHUB_TOKEN" | gh auth login --with-token
+        gh auth setup-git
         echo "Success."
     elif gh auth status &>/dev/null; then
         echo "Already authenticated."
+        gh auth setup-git
     else
         echo "GitHub CLI is not authenticated. Running interactive login..."
         gh auth login
+        gh auth setup-git
     fi
 fi
 
@@ -154,6 +178,7 @@ if has_choice "CLONE"; then
         if ! gh auth status &>/dev/null; then
             echo "GitHub CLI must be authenticated to fetch repos. Running interactive login..."
             gh auth login
+            gh auth setup-git
         fi
         echo "Fetching repos from GitHub (this may take a second)..."
         # Fetches HTTPS URLs of all repos you have access to
