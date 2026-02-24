@@ -1,6 +1,9 @@
 #!/bin/bash
 set -e
 
+# Run as normal user; script uses sudo only when needed
+[ "$(id -u)" -eq 0 ] && { echo "Do not run as root. Run as your normal user."; exit 1; }
+
 # ==========================================
 # 0. CONFIGURATION & PRE-FLIGHT
 # ==========================================

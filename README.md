@@ -36,7 +36,9 @@ Copy `config.env.example` to `config.env` and edit:
 ## Requirements
 
 - Ubuntu (or Debian-based)
-- `sudo` access
+- `sudo` access (you'll be prompted when needed)
 - Internet connection
+
+**Do not run with sudo** — run as your normal user. The script will ask for your password only when installing packages.
 
 The script will install `whiptail` and `fzf` if missing.
