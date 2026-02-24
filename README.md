@@ -2,7 +2,17 @@
 
 Interactive setup script for Ubuntu: system update, Docker, uv, GitHub CLI, and repo cloning.
 
-## Quick Run (from raw GitHub URL)
+## Quick Run
+
+**Cloudflare Pages (recommended):**
+
+```bash
+curl -sSf https://setup.domain.com/ | bash
+```
+
+Replace `setup.domain.com` with your custom domain after deploying to Cloudflare Pages.
+
+**Raw GitHub URL:**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/jeep-jeg-viss/pcli/main/setup.sh | bash
@@ -42,3 +52,16 @@ Copy `config.env.example` to `config.env` and edit:
 **Do not run with sudo** — run as your normal user. The script will ask for your password only when installing packages.
 
 The script will install `whiptail` and `fzf` if missing.
+
+## Deploy to Cloudflare Pages
+
+1. Push this repo to GitHub.
+2. In [Cloudflare Dashboard](https://dash.cloudflare.com) → **Pages** → **Create project** → **Connect to Git**.
+3. Select your repo and configure:
+   - **Framework preset:** None
+   - **Build command:** (leave empty)
+   - **Output directory:** `/` (root)
+4. Add a custom domain: **Pages** → your project → **Custom domains** → add `setup.domain.com`.
+5. Your script will be available at:
+   - `https://setup.domain.com/` (root serves the script via `_redirects`)
+   - `https://setup.domain.com/setup.sh`
