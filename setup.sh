@@ -13,6 +13,20 @@ fi
 # Ensure common tool paths (uv, etc.) are available
 export PATH="$HOME/.local/bin:$PATH"
 
+# Persist PATH to shell config so uv works after script exits
+ensure_path_in_shell() {
+    local line='export PATH="$HOME/.local/bin:$PATH"'
+    for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+        [ -f "$rc" ] || touch "$rc"
+        grep -qF '.local/bin' "$rc" 2>/dev/null || {
+            echo "" >> "$rc"
+            echo "# Added by pcli setup" >> "$rc"
+            echo "$line" >> "$rc"
+        }
+    done
+}
+ensure_path_in_shell
+
 # Function to check if a command exists
 exists() {
     command -v "$1" >/dev/null 2>&1
@@ -213,3 +227,11 @@ if has_choice "CLONE"; then
 fi
 
 echo "--- Setup Complete! ---"
+
+# Start fresh shell so uv and other tools are available (when run interactively)
+if [ -t 0 ]; then
+    echo "Starting new shell with updated environment..."
+    exec bash
+else
+    echo "Run 'source ~/.bashrc' or open a new terminal for uv to be available."
+fi
