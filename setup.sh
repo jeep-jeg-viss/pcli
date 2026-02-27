@@ -1,240 +1,533 @@
 #!/bin/bash
-set -e
+#===============================================================================
+# PCLI Personal Setup Script - Production Version
+# Version: 2.0.0
+# Description: Automated personal development environment setup
+# Usage: ./setup.sh (DO NOT run as root)
+#===============================================================================
 
-# Run as normal user; script uses sudo only when needed
-[ "$(id -u)" -eq 0 ] && { echo "Do not run as root. Run as your normal user."; exit 1; }
+set -euo pipefail
 
-# ==========================================
-# 0. CONFIGURATION & PRE-FLIGHT
-# ==========================================
+#-------------------------------------------------------------------------------
+# CONFIGURATION
+#-------------------------------------------------------------------------------
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly CONFIG_FILE="${SCRIPT_DIR}/config.env"
+readonly LOG_FILE="${HOME}/.pcli_setup.log"
+readonly TARGET_DIR_DEFAULT="$HOME/code"
 
-# Load config
-if [ -f "config.env" ]; then
-    source config.env
-fi
+#-------------------------------------------------------------------------------
+# COLORS & FORMATTING
+#-------------------------------------------------------------------------------
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly BLUE='\033[0;34m'
+readonly NC='\033[0m' # No Color
 
-# Ensure common tool paths (uv, etc.) are available
-export PATH="$HOME/.local/bin:$PATH"
-
-# Persist PATH to shell config so uv works after script exits
-ensure_path_in_shell() {
-    local line='export PATH="$HOME/.local/bin:$PATH"'
-    for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
-        [ -f "$rc" ] || touch "$rc"
-        grep -qF '.local/bin' "$rc" 2>/dev/null || {
-            echo "" >> "$rc"
-            echo "# Added by pcli setup" >> "$rc"
-            echo "$line" >> "$rc"
-        }
-    done
+#-------------------------------------------------------------------------------
+# LOGGING FUNCTIONS
+#-------------------------------------------------------------------------------
+log() {
+    local level="$1"
+    shift
+    local message="$*"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
+    
+    case "$level" in
+        INFO)  echo -e "${BLUE}[INFO]${NC} $message" ;;
+        SUCCESS) echo -e "${GREEN}[SUCCESS]${NC} $message" ;;
+        WARN)  echo -e "${YELLOW}[WARN]${NC} $message" ;;
+        ERROR) echo -e "${RED}[ERROR]${NC} $message" ;;
+    esac
 }
-ensure_path_in_shell
 
-# Function to check if a command exists
+log_info() { log "INFO" "$@"; }
+log_success() { log "SUCCESS" "$@"; }
+log_warn() { log "WARN" "$@"; }
+log_error() { log "ERROR" "$@"; }
+
+#-------------------------------------------------------------------------------
+# CLEANUP & ERROR HANDLING
+#-------------------------------------------------------------------------------
+cleanup() {
+    local exit_code=$?
+    if [ $exit_code -ne 0 ]; then
+        log_error "Script exited with error code: $exit_code"
+        log_error "Check log file: $LOG_FILE"
+    fi
+}
+trap cleanup EXIT
+
+error_exit() {
+    log_error "$1"
+    exit "${2:-1}"
+}
+
+#-------------------------------------------------------------------------------
+# UTILITY FUNCTIONS
+#-------------------------------------------------------------------------------
 exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-# Check if apt package is installed
 apt_installed() {
     dpkg -s "$1" &>/dev/null
 }
 
-# Ensure whiptail (for menu) and fzf (for repo selection) are installed
-if ! exists whiptail || ! exists fzf; then
-    echo "Installing interface tools (whiptail, fzf)..."
-    sudo apt-get update && sudo apt-get install -y whiptail fzf
-else
-    echo "Interface tools (whiptail, fzf) already installed."
-fi
+is_sourced() {
+    [ "${BASH_SOURCE[0]}" != "${0}" ]
+}
 
-# ==========================================
-# 1. MAIN MENU
-# ==========================================
+require_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        error_exit "This command requires root privileges. Please run with sudo."
+    fi
+}
 
-CHOICES=$(whiptail --title "Personal Setup" --checklist \
-"Select tasks:" 20 78 12 \
-"UPDATE" "System Update (apt update/upgrade)" ON \
-"DOCKER" "Docker Engine & Compose" ON \
-"UV" "uv (Python Tool)" ON \
-"TOOLS" "XVFB, Vim, Common Utils" ON \
-"ALIAS" "Alias nano to vim" OFF \
-"GITHUB" "GitHub CLI (gh) + Auth" ON \
-"CLONE" "Clone Repositories (Interactive)" ON \
-3>&1 1>&2 2>&3)
+require_normal_user() {
+    if [ "$(id -u)" -eq 0 ]; then
+        error_exit "Do not run as root. Run as your normal user."
+    fi
+}
 
-if [ $? -ne 0 ]; then echo "Cancelled."; exit 0; fi
+#-------------------------------------------------------------------------------
+# PRE-FLIGHT CHECKS
+#-------------------------------------------------------------------------------
+preflight_checks() {
+    log_info "Running pre-flight checks..."
+    
+    # Check if running as root
+    require_normal_user
+    
+    # Check if running on supported OS
+    if [ -f /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        source /etc/os-release
+        if [[ "$ID" != "ubuntu" && "$ID" != "debian" ]]; then
+            log_warn "Unsupported OS: $ID. Script tested on Ubuntu/Debian."
+        fi
+    else
+        log_warn "Cannot detect OS. Continuing with caution."
+    fi
+    
+    # Check disk space (minimum 5GB free)
+    local available_space
+    available_space=$(df -m "$HOME" | awk 'NR==2 {print $4}')
+    if [ "$available_space" -lt 5120 ]; then
+        error_exit "Insufficient disk space. Need at least 5GB free."
+    fi
+    
+    # Validate config file permissions if it exists
+    if [ -f "$CONFIG_FILE" ]; then
+        local perms
+        perms=$(stat -c %a "$CONFIG_FILE" 2>/dev/null || stat -f %Lp "$CONFIG_FILE" 2>/dev/null)
+        if [ "$perms" != "600" ]; then
+            log_warn "config.env should be 600 (private). Fixing permissions..."
+            chmod 600 "$CONFIG_FILE"
+        fi
+    fi
+    
+    log_success "Pre-flight checks passed."
+}
 
-has_choice() { [[ "$CHOICES" == *"$1"* ]]; }
-
-# ==========================================
-# 2. INSTALLATION TASKS
-# ==========================================
-
-if has_choice "UPDATE"; then
-    echo "--- Updating System ---"
-    sudo apt-get update -y && sudo apt-get upgrade -y
-    NEEDED=()
-    for pkg in curl wget gpg coreutils build-essential git; do
-        apt_installed "$pkg" || NEEDED+=("$pkg")
+#-------------------------------------------------------------------------------
+# PATH MANAGEMENT
+#-------------------------------------------------------------------------------
+ensure_path_in_shell() {
+    local line='export PATH="$HOME/.local/bin:$PATH"'
+    local added=0
+    
+    for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+        if [ -f "$rc" ]; then
+            if ! grep -qF '.local/bin' "$rc" 2>/dev/null; then
+                echo "" >> "$rc"
+                echo "# Added by pcli setup ($(date '+%Y-%m-%d'))" >> "$rc"
+                echo "$line" >> "$rc"
+                added=1
+            fi
+        else
+            touch "$rc"
+            echo "" >> "$rc"
+            echo "# Added by pcli setup ($(date '+%Y-%m-%d'))" >> "$rc"
+            echo "$line" >> "$rc"
+            added=1
+        fi
     done
-    [ ${#NEEDED[@]} -gt 0 ] && sudo apt-get install -y "${NEEDED[@]}" || echo "Core packages already installed."
-fi
+    
+    if [ $added -eq 1 ]; then
+        log_info "PATH updated in shell configuration files."
+    fi
+}
 
-if has_choice "DOCKER"; then
+#-------------------------------------------------------------------------------
+# PACKAGE INSTALLATION
+#-------------------------------------------------------------------------------
+install_packages() {
+    local -a packages=("$@")
+    local -a needed=()
+    
+    for pkg in "${packages[@]}"; do
+        if ! apt_installed "$pkg"; then
+            needed+=("$pkg")
+        fi
+    done
+    
+    if [ ${#needed[@]} -gt 0 ]; then
+        log_info "Installing packages: ${needed[*]}"
+        sudo apt-get update -qq
+        if ! sudo apt-get install -y "${needed[@]}"; then
+            error_exit "Failed to install packages: ${needed[*]}"
+        fi
+        log_success "Packages installed successfully."
+    else
+        log_info "All packages already installed."
+    fi
+}
+
+#-------------------------------------------------------------------------------
+# INSTALLATION TASKS
+#-------------------------------------------------------------------------------
+task_update_system() {
+    log_info "Updating system packages..."
+    
+    if ! sudo apt-get update -qq; then
+        error_exit "Failed to update package lists."
+    fi
+    
+    if ! sudo apt-get upgrade -y; then
+        error_exit "Failed to upgrade packages."
+    fi
+    
+    # Install core dependencies
+    install_packages curl wget gpg coreutils build-essential git jq
+    
+    log_success "System update complete."
+}
+
+task_install_docker() {
     if exists docker; then
-        echo "Docker already installed."
-    else
-        echo "--- Installing Docker ---"
-        sudo install -m 0755 -d /etc/apt/keyrings
-        sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-        sudo chmod a+r /etc/apt/keyrings/docker.asc
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
-          $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-        sudo apt-get update -y
-        sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-        sudo usermod -aG docker "$USER"
-        echo "Note: You may need to log out and back in for docker group to take effect."
+        log_info "Docker already installed."
+        return 0
     fi
-fi
+    
+    log_info "Installing Docker Engine..."
+    
+    # Remove old versions
+    sudo apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
+    
+    # Set up repository
+    sudo install -m 0755 -d /etc/apt/keyrings
+    sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    sudo chmod a+r /etc/apt/keyrings/docker.asc
+    
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+    
+    sudo apt-get update -qq
+    sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    
+    # Add user to docker group
+    sudo usermod -aG docker "$USER"
+    
+    log_success "Docker installed. Log out and back in for group changes to take effect."
+}
 
-if has_choice "UV"; then
+task_install_uv() {
     if exists uv; then
-        echo "uv already installed."
-    else
-        echo "--- Installing uv ---"
-        curl -LsSf https://astral.sh/uv/install.sh | sh
-        export PATH="$HOME/.local/bin:$PATH"
+        log_info "uv already installed."
+        return 0
     fi
-fi
-
-if has_choice "TOOLS"; then
-    if apt_installed xvfb && apt_installed vim; then
-        echo "XVFB and Vim already installed."
-    else
-        echo "--- Installing XVFB & Vim ---"
-        sudo apt-get install -y xvfb vim
+    
+    log_info "Installing uv (Python toolchain)..."
+    
+    if ! curl -LsSf https://astral.sh/uv/install.sh | sh; then
+        error_exit "Failed to install uv."
     fi
-fi
+    
+    export PATH="$HOME/.local/bin:$PATH"
+    log_success "uv installed successfully."
+}
 
-if has_choice "ALIAS"; then
-    RC="$HOME/.bashrc"
-    if ! grep -q "alias nano='vim'" "$RC"; then
-        echo "alias nano='vim'" >> "$RC"
-        echo "export EDITOR='vim'" >> "$RC"
-        echo "Alias added."
-    fi
-fi
+task_install_tools() {
+    log_info "Installing common development tools..."
+    install_packages xvfb vim
+    
+    # Additional useful tools
+    install_packages htop tree ripgrep fd-find 2>/dev/null || true
+    
+    log_success "Development tools installed."
+}
 
-# ==========================================
-# 3. GITHUB AUTH
-# ==========================================
+task_setup_aliases() {
+    log_info "Setting up shell aliases..."
+    
+    for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+        [ -f "$rc" ] || touch "$rc"
+        
+        if ! grep -q "alias nano='vim'" "$rc"; then
+            {
+                echo ""
+                echo "# Added by pcli setup ($(date '+%Y-%m-%d'))"
+                echo "alias nano='vim'"
+                echo "export EDITOR='vim'"
+            } >> "$rc"
+        fi
+    done
+    
+    log_success "Aliases configured."
+}
 
-if has_choice "GITHUB"; then
-    if exists gh; then
-        echo "GitHub CLI already installed."
-    else
-        echo "--- Installing GitHub CLI ---"
-        # Standard GH install steps...
-        sudo mkdir -p -m 755 /etc/apt/keyrings && wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null
+task_setup_github() {
+    if ! exists gh; then
+        log_info "Installing GitHub CLI..."
+        
+        sudo mkdir -p -m 755 /etc/apt/keyrings
+        wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null
         sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
         echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-        sudo apt-get update -y
-        sudo apt-get install -y gh
+        
+        sudo apt-get update -qq
+        install_packages gh
+    else
+        log_info "GitHub CLI already installed."
     fi
-
-    echo "--- Authenticating GitHub ---"
-    if [ -n "$GITHUB_TOKEN" ]; then
+    
+    log_info "Setting up GitHub authentication..."
+    
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
         echo "$GITHUB_TOKEN" | gh auth login --with-token
         gh auth setup-git
-        echo "Success."
+        log_success "Authenticated using GITHUB_TOKEN."
     elif gh auth status &>/dev/null; then
-        echo "Already authenticated."
+        log_info "Already authenticated."
         gh auth setup-git
     else
-        echo "GitHub CLI is not authenticated. Running interactive login..."
-        gh auth login
+        log_info "Running interactive GitHub authentication..."
+        if ! gh auth login; then
+            error_exit "GitHub authentication failed."
+        fi
         gh auth setup-git
     fi
-fi
-
-# ==========================================
-# 4. REPO SELECTION (The Upgrade)
-# ==========================================
-
-if has_choice "CLONE"; then
-    echo "--- Repository Selection ---"
     
-    # 1. Ask for Source
-    SOURCE=$(whiptail --title "Repo Source" --menu "Where should we get repos from?" 15 60 3 \
-    "1" "Config file only (config.env)" \
-    "2" "GitHub API only (Fetch all my repos)" \
-    "3" "Both (Merge lists)" 3>&1 1>&2 2>&3)
+    log_success "GitHub setup complete."
+}
 
-    if [ -z "$SOURCE" ]; then echo "Cancelled."; exit 0; fi
-
-    ALL_URLS=""
-
-    # Get Config Repos
-    if [ "$SOURCE" == "1" ] || [ "$SOURCE" == "3" ]; then
-        if [ -n "${REPOS+x}" ]; then
-            for r in "${REPOS[@]}"; do
-                ALL_URLS+="$r"$'\n'
+task_clone_repos() {
+    log_info "Starting repository selection..."
+    
+    # Ensure git is available
+    if ! exists git; then
+        log_info "Installing git (required for cloning)..."
+        install_packages git
+    fi
+    
+    # Ensure gh is available for API access
+    if ! exists gh; then
+        log_warn "GitHub CLI not found. Fetching repos via API will not work."
+    fi
+    
+    # Ask for source
+    local source_choice
+    source_choice=$(whiptail --title "Repo Source" --menu "Where should we get repos from?" 15 60 3 \
+        "1" "Config file only (config.env)" \
+        "2" "GitHub API only (Fetch all my repos)" \
+        "3" "Both (Merge lists)" \
+        3>&1 1>&2 2>&3) || {
+        log_info "Repo source selection cancelled."
+        return 0
+    }
+    
+    local all_urls=""
+    
+    # Get repos from config
+    if [[ "$source_choice" == "1" || "$source_choice" == "3" ]]; then
+        if [ -n "${REPOS:-}" ]; then
+            # shellcheck disable=SC2206
+            local repos_array=($REPOS)
+            for r in "${repos_array[@]}"; do
+                all_urls+="$r"$'\n'
             done
+            log_info "Loaded ${#repos_array[@]} repos from config."
         else
-            echo "Warning: REPOS not defined in config.env. Add REPOS=(url1 url2) for config-based repos."
+            log_warn "REPOS not defined in config.env."
         fi
     fi
-
-    # Get API Repos (requires gh auth)
-    if [ "$SOURCE" == "2" ] || [ "$SOURCE" == "3" ]; then
-        if ! exists gh; then
-            echo "Error: GitHub CLI (gh) is required for this option. Run setup again and select 'GitHub CLI (gh) + Auth' first."
-            exit 1
+    
+    # Get repos from GitHub API
+    if [[ "$source_choice" == "2" || "$source_choice" == "3" ]]; then
+        if exists gh && gh auth status &>/dev/null; then
+            log_info "Fetching repos from GitHub API..."
+            local api_urls
+            api_urls=$(gh repo list --limit 500 --json url --jq '.[].url' 2>/dev/null) || {
+                log_warn "Failed to fetch repos from GitHub API."
+                api_urls=""
+            }
+            all_urls+="$api_urls"$'\n'
+        else
+            log_warn "GitHub CLI not authenticated. Skipping API fetch."
         fi
-        if ! gh auth status &>/dev/null; then
-            echo "GitHub CLI must be authenticated to fetch repos. Running interactive login..."
-            gh auth login
-            gh auth setup-git
-        fi
-        echo "Fetching repos from GitHub (this may take a second)..."
-        # Fetches HTTPS URLs of all repos you have access to
-        API_URLS=$(gh repo list --limit 500 --json url --jq '.[].url')
-        ALL_URLS+="$API_URLS"$'\n'
     fi
-
-    # 2. Interactive Selection using FZF
-    # -m allows multi-select (TAB to select)
-    # --height makes it look like a popup
-    echo "Opening Selector... (Use TAB to select multiple, ENTER to confirm)"
-    SELECTED_REPOS=$(echo "$ALL_URLS" | grep -v "^$" | sort | uniq | fzf -m --height=40% --layout=reverse --border --prompt="Select Repos to Clone > ")
-
-    if [ -z "$SELECTED_REPOS" ]; then
-        echo "No repos selected."
-    else
-        # 3. Setup Target Dir
-        if [ -z "$TARGET_DIR" ]; then TARGET_DIR="$HOME/code"; fi
-        mkdir -p "$TARGET_DIR"
+    
+    # Remove empty lines and duplicates
+    all_urls=$(echo "$all_urls" | grep -v "^$" | sort -u)
+    
+    if [ -z "$all_urls" ]; then
+        log_warn "No repositories found to clone."
+        return 0
+    fi
+    
+    # Interactive selection with fzf
+    log_info "Opening repository selector... (TAB to select multiple, ENTER to confirm)"
+    local selected_repos
+    selected_repos=$(echo "$all_urls" | fzf -m --height=40% --layout=reverse --border --prompt="Select Repos to Clone > ") || {
+        log_info "Repository selection cancelled."
+        return 0
+    }
+    
+    if [ -z "$selected_repos" ]; then
+        log_info "No repositories selected."
+        return 0
+    fi
+    
+    # Setup target directory
+    local target_dir="${TARGET_DIR:-$TARGET_DIR_DEFAULT}"
+    mkdir -p "$target_dir"
+    
+    log_info "Cloning repositories to $target_dir..."
+    local cloned=0
+    local skipped=0
+    
+    while IFS= read -r repo_url; do
+        [ -z "$repo_url" ] && continue
         
-        echo "--- Cloning to $TARGET_DIR ---"
-        while IFS= read -r repo_url; do
-            repo_name=$(basename "$repo_url" .git)
-            if [ -d "$TARGET_DIR/$repo_name" ]; then
-                echo "Skipping $repo_name (exists)"
+        local repo_name
+        repo_name=$(basename "$repo_url" .git)
+        
+        if [ -d "$target_dir/$repo_name" ]; then
+            log_info "Skipping $repo_name (already exists)"
+            ((skipped++))
+        else
+            if git clone "$repo_url" "$target_dir/$repo_name"; then
+                log_success "Cloned $repo_name"
+                ((cloned++))
             else
-                echo "Cloning $repo_name..."
-                git clone "$repo_url" "$TARGET_DIR/$repo_name"
+                log_error "Failed to clone $repo_name"
             fi
-        done <<< "$SELECTED_REPOS"
+        fi
+    done <<< "$selected_repos"
+    
+    log_success "Clone complete: $cloned cloned, $skipped skipped."
+}
+
+#-------------------------------------------------------------------------------
+# MAIN MENU
+#-------------------------------------------------------------------------------
+show_main_menu() {
+    local choices
+    
+    choices=$(whiptail --title "PCLI Personal Setup" --checklist \
+        "Select tasks to perform:" 20 78 12 \
+        "UPDATE" "System Update & Core Packages" ON \
+        "DOCKER" "Docker Engine & Compose" ON \
+        "UV" "uv (Python Toolchain)" ON \
+        "TOOLS" "XVFB, Vim & Dev Utils" ON \
+        "ALIAS" "Shell Aliases (nano→vim)" OFF \
+        "GITHUB" "GitHub CLI + Authentication" ON \
+        "CLONE" "Clone Repositories (Interactive)" ON \
+        3>&1 1>&2 2>&3) || {
+        log_info "Setup cancelled by user."
+        exit 0
+    }
+    
+    if [ -z "$choices" ]; then
+        log_info "No tasks selected."
+        exit 0
     fi
-fi
+    
+    echo "$choices"
+}
 
-echo "--- Setup Complete! ---"
+has_choice() {
+    [[ "$1" == *"$2"* ]]
+}
 
-# Start fresh shell so uv and other tools are available (when run interactively)
-if [ -t 0 ]; then
-    echo "Starting new shell with updated environment..."
-    exec bash
-else
-    echo "Run 'source ~/.bashrc' or open a new terminal for uv to be available."
-fi
+#-------------------------------------------------------------------------------
+# MAIN EXECUTION
+#-------------------------------------------------------------------------------
+main() {
+    echo ""
+    echo "========================================"
+    echo "  PCLI Personal Setup Script v2.0.0"
+    echo "========================================"
+    echo ""
+    
+    # Initialize
+    preflight_checks
+    
+    # Load configuration
+    if [ -f "$CONFIG_FILE" ]; then
+        # shellcheck disable=SC1091
+        source "$CONFIG_FILE"
+        log_info "Configuration loaded from $CONFIG_FILE"
+    else
+        log_info "No config.env found. Using defaults."
+    fi
+    
+    # Ensure PATH is set
+    export PATH="$HOME/.local/bin:$PATH"
+    ensure_path_in_shell
+    
+    # Show menu and get choices
+    local choices
+    choices=$(show_main_menu)
+    
+    # Execute selected tasks
+    if has_choice "$choices" "UPDATE"; then
+        task_update_system
+    fi
+    
+    if has_choice "$choices" "DOCKER"; then
+        task_install_docker
+    fi
+    
+    if has_choice "$choices" "UV"; then
+        task_install_uv
+    fi
+    
+    if has_choice "$choices" "TOOLS"; then
+        task_install_tools
+    fi
+    
+    if has_choice "$choices" "ALIAS"; then
+        task_setup_aliases
+    fi
+    
+    if has_choice "$choices" "GITHUB"; then
+        task_setup_github
+    fi
+    
+    if has_choice "$choices" "CLONE"; then
+        task_clone_repos
+    fi
+    
+    # Completion
+    echo ""
+    log_success "========================================"
+    log_success "  Setup Complete!"
+    log_success "========================================"
+    echo ""
+    
+    if is_sourced; then
+        log_info "Script was sourced. Run 'source ~/.bashrc' or open new terminal."
+    else
+        log_info "Open a new terminal for all changes to take effect."
+    fi
+    
+    log_info "Log file: $LOG_FILE"
+}
+
+# Run main function
+main "$@"
