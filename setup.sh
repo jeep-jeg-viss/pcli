@@ -291,8 +291,8 @@ install_prerequisites() {
 do_system_update() {
     log_section "Updating System"
 
-    export NEEDRESTART_MODE=a
-    export NEEDRESTART_SUSPEND=1
+    log INFO "Configuring needrestart to auto-accept..."
+    run_sudo sed -i 's/#\$nrconf{restart}.*/\$nrconf{restart} = '"'"'a'"'"';/' /etc/needrestart/needrestart.conf 2>/dev/null || true
 
     log INFO "Running apt update..."
     run_sudo apt-get update -y -qq
