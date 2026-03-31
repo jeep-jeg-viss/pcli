@@ -114,6 +114,73 @@ backup_file() {
 }
 
 # =============================================================================
+# UBUNTU COMPATIBILITY DETECTION
+# =============================================================================
+
+detect_ubuntu_codename() {
+    local codename=""
+    if [ -f /etc/os-release ]; then
+        codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+    fi
+    if [ -z "$codename" ] && [ -f /etc/lsb-release ]; then
+        codename="$(. /etc/lsb-release && echo "$DISTRIB_CODENAME")"
+    fi
+    if [ -z "$codename" ]; then
+        codename="$(lsb_release -cs 2>/dev/null || echo "")"
+    fi
+    if [ -z "$codename" ]; then
+        codename="jammy"
+    fi
+    echo "$codename"
+}
+
+detect_architecture() {
+    local arch
+    arch="$(dpkg --print-architecture 2>/dev/null || echo "amd64")"
+    case "$arch" in
+        i386|i486|i586|i686) arch="amd64" ;;
+        arm64) arch="arm64" ;;
+        *) arch="amd64" ;;
+    esac
+    echo "$arch"
+}
+
+CODENAME="$(detect_ubuntu_codename)"
+ARCH="$(detect_architecture)"
+
+debug_info() {
+    log INFO "Ubuntu codename: $CODENAME"
+    log INFO "Architecture: $ARCH"
+    log INFO "OS: $(. /etc/os-release && echo "$ID $VERSION_ID")"
+    log INFO "curl: $(curl --version | head -1)"
+}
+
+install_lsb_release() {
+    if ! command -v lsb_release &>/dev/null; then
+        run_sudo apt-get install -y -qq lsb-release 2>/dev/null || true
+    fi
+}
+
+download_with_retry() {
+    local url="$1"
+    local dest="$2"
+    local max_attempts=3
+    local attempt=1
+    while [ $attempt -le $max_attempts ]; do
+        if curl -fsSL --connect-timeout 30 --max-time 120 "$url" -o "$dest" 2>/dev/null; then
+            return 0
+        fi
+        log WARN "Download attempt $attempt/$max_attempts failed for $url, retrying..."
+        attempt=$((attempt + 1))
+        sleep 2
+    done
+    return 1
+}
+
+log INFO "Detecting system..."
+install_lsb_release
+
+# =============================================================================
 # PATH CONFIGURATION
 # =============================================================================
 
@@ -227,24 +294,8 @@ do_system_update() {
     log INFO "Running apt update..."
     run_sudo apt-get update -y -qq
 
-    log INFO "Running apt upgrade..."
-    run_sudo apt-get upgrade -y -qq
-
-    # Install core packages if missing
-    local needed_packages=()
-    for pkg in curl wget gpg coreutils build-essential git; do
-        if ! apt_installed "$pkg"; then
-            needed_packages+=("$pkg")
-        fi
-    done
-
-    if [ ${#needed_packages[@]} -gt 0 ]; then
-        log INFO "Installing missing core packages: ${needed_packages[*]}"
-        run_sudo apt-get install -y -qq "${needed_packages[@]}"
-        log SUCCESS "Core packages installed"
-    else
-        log INFO "Core packages already installed"
-    fi
+    log INFO "Installing core packages..."
+    run_sudo apt-get install -y -qq curl wget gpg ca-certificates build-essential git whiptail fzf xvfb vim
 
     log SUCCESS "System update complete"
 }
@@ -261,6 +312,17 @@ install_docker() {
         return 0
     fi
 
+    source /etc/os-release
+    case "$VERSION_CODENAME" in
+      jammy|noble|questing) ;;
+      *)
+        log ERROR "Unsupported Ubuntu release for Docker: $VERSION_CODENAME (supported: jammy, noble, questing)"
+        return 1
+        ;;
+    esac
+
+    debug_info
+
     log INFO "Installing Docker Engine and Compose..."
 
     # Remove old docker installations if any
@@ -276,24 +338,17 @@ install_docker() {
     run_sudo mkdir -p -m 0755 /etc/apt/keyrings
 
     # Download and verify Docker GPG key
-    local docker_gpg_url="https://download.docker.com/linux/ubuntu/gpg"
     log INFO "Downloading Docker GPG key..."
-    if ! run_cmd sudo curl -fsSL "$docker_gpg_url" -o /etc/apt/keyrings/docker.asc; then
+    if ! download_with_retry "https://download.docker.com/linux/ubuntu/gpg" "/tmp/docker.gpg"; then
         log ERROR "Failed to download Docker GPG key"
         return 1
     fi
-
+    run_sudo mv /tmp/docker.gpg /etc/apt/keyrings/docker.asc
     run_sudo chmod a+r /etc/apt/keyrings/docker.asc
 
-    # Add Docker repository
-    local os_release
-    os_release="$(. /etc/os-release && echo "$VERSION_CODENAME")"
-    local arch
-    arch="$(dpkg --print-architecture)"
-
-    log INFO "Adding Docker repository for $os_release ($arch)..."
+    log INFO "Adding Docker repository for $CODENAME ($ARCH)..."
     local docker_repo_file="/etc/apt/sources.list.d/docker.list"
-    echo "deb [arch=$arch signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $os_release stable" | \
+    echo "deb [arch=$ARCH signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $CODENAME stable" | \
         sudo tee "$docker_repo_file" > /dev/null
 
     # Update and install Docker
@@ -342,7 +397,7 @@ install_uv() {
 
     # Download and run uv installation script
     local install_script="/tmp/uv_install.sh"
-    if ! run_cmd curl -LsSf https://astral.sh/uv/install.sh -o "$install_script"; then
+    if ! download_with_retry "https://astral.sh/uv/install.sh" "$install_script"; then
         log ERROR "Failed to download uv installer"
         return 1
     fi
@@ -455,20 +510,17 @@ install_github_cli() {
     run_sudo mkdir -p -m 755 /etc/apt/keyrings
 
     # Download and verify GitHub CLI keyring
-    local gh_keyring_url="https://cli.github.com/packages/githubcli-archive-keyring.gpg"
     log INFO "Downloading GitHub CLI keyring..."
-    if ! run_cmd wget -qO- "$gh_keyring_url" | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null; then
+    if ! download_with_retry "https://cli.github.com/packages/githubcli-archive-keyring.gpg" "/tmp/gh.gpg"; then
         log ERROR "Failed to download GitHub CLI keyring"
         return 1
     fi
-
+    run_sudo mv /tmp/gh.gpg /etc/apt/keyrings/githubcli-archive-keyring.gpg
     run_sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
 
     # Add GitHub CLI repository
-    local arch
-    arch="$(dpkg --print-architecture)"
     local gh_repo_file="/etc/apt/sources.list.d/github-cli.list"
-    echo "deb [arch=$arch signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | \
+    echo "deb [arch=$ARCH signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | \
         sudo tee "$gh_repo_file" > /dev/null
 
     # Update and install
