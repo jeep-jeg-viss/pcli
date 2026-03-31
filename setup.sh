@@ -291,6 +291,9 @@ install_prerequisites() {
 do_system_update() {
     log_section "Updating System"
 
+    export NEEDRESTART_MODE=a
+    export NEEDRESTART_SUSPEND=1
+
     log INFO "Running apt update..."
     run_sudo apt-get update -y -qq
 
